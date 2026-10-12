@@ -37,12 +37,75 @@ rồi gọi verify() phải trả về False.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
+
+ZERO_HASH = "0" * 64
+
+
+def _compute_hash(entry_without_hash: dict) -> str:
+    """SHA-256 của JSON đã sort_keys, không bao gồm field 'hash'."""
+    payload = {k: v for k, v in entry_without_hash.items() if k != "hash"}
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _get_last_hash(path: Path) -> str:
+    """Đọc hash của dòng cuối cùng trong file, hoặc ZERO_HASH nếu file rỗng/chưa tồn tại."""
+    if not path.exists():
+        return ZERO_HASH
+    content = path.read_text(encoding="utf-8").strip()
+    if not content:
+        return ZERO_HASH
+    last_line = content.splitlines()[-1]
+    return json.loads(last_line).get("hash", ZERO_HASH)
 
 
 def append(entry: dict, path: Path) -> dict:
-    raise NotImplementedError("BƯỚC 3d: implement ledger append")
+    """Append một entry vào ledger JSONL với hash chain."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    entry = dict(entry)  # shallow copy
+    entry["prev_hash"] = _get_last_hash(path)
+    entry["hash"] = _compute_hash(entry)
+
+    line = json.dumps(entry, ensure_ascii=False)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+    return entry
 
 
 def verify(path: Path) -> bool:
-    raise NotImplementedError("BƯỚC 3d: implement ledger verify")
+    """Kiểm tra toàn bộ hash chain trong file ledger."""
+    if not path.exists():
+        return True
+
+    content = path.read_text(encoding="utf-8").strip()
+    if not content:
+        return True
+
+    lines = content.splitlines()
+    expected_prev = ZERO_HASH
+
+    for line in lines:
+        entry = json.loads(line)
+
+        # Kiểm tra reason non-empty
+        if not entry.get("reason"):
+            return False
+
+        # Kiểm tra prev_hash liên kết đúng
+        if entry.get("prev_hash") != expected_prev:
+            return False
+
+        # Tính lại hash và so sánh
+        stored_hash = entry.get("hash")
+        recomputed = _compute_hash(entry)
+        if stored_hash != recomputed:
+            return False
+
+        expected_prev = stored_hash
+
+    return True

@@ -1,10 +1,12 @@
-# Compliance mapping — điền trong checkpoint 5
+# Báo cáo Compliance Mapping — Checkpoint 5
+
+Bảng đối chiếu các biện pháp kiểm soát an toàn kỹ thuật (Controls) đã triển khai trong bài lab với các yêu cầu quy định pháp luật và chuẩn an toàn thông tin OWASP Agentic AI:
 
 | Nguồn / yêu cầu | Control đã làm | Evidence file:dòng | Giới hạn |
 |---|---|---|---|
-| Luật 91/2025/QH15 | | | |
-| NĐ 356/2025/NĐ-CP | | | |
-| Luật AI 134/2025/QH15 | | | |
-| OWASP ASI01, ASI03, ASI04 | | | |
+| **Luật 91/2025/QH15** (Bảo vệ dữ liệu cá nhân) | - PII Detection & Redaction (CCCD, SĐT, STK, Email) trước khi truyền qua boundary.<br>- Phân loại dữ liệu `restricted`, `internal`, `public`.<br>- Phân quyền truy cập dữ liệu nhạy cảm theo vai trò OBO (support_l1 vs dpo). | - `agent/pii.py:15-115`<br>- `agent/policy.py:84-148`<br>- `agent/runner.py:117-185`<br>- `reports/ledger.jsonl:1-24` | Sử dụng tập regex mô phỏng trên synthetic testset (`tests/vn_pii_testset.jsonl`). Chưa đối chiếu toàn văn điều khoản luật gốc cụ thể nên cần DPO thẩm định thêm ở môi trường production. |
+| **NĐ 356/2025/NĐ-CP** (Quy định chi tiết thi hành, kiểm toán & DPIA) | - Audit ledger append-only, tamper-evident với chuỗi băm SHA-256 hash chain.<br>- Mọi tool call đều ghi nhận lý do (`reason`), timestamp, agent_id, run_id, on_behalf_of, args_hash (không ghi thô PII vào log).<br>- Đánh giá tác động DPIA-lite. | - `agent/ledger.py:27-105`<br>- `reports/ledger.jsonl:1-24`<br>- `reports/dpia-lite.md:1-30` | Hash chain được lưu cục bộ trong một file JSONL, chưa liên kết với External Trusted Timestamping Server hay hệ thống WORM lưu trữ bất biến. |
+| **Luật AI 134/2025/QH15** (Quản lý phát triển & ứng dụng Trí tuệ nhân tạo) | - Kiến trúc Trifecta split phân tách rõ trách nhiệm: Run A (đọc dữ liệu không tin cậy, không chạm egress/private store) và Run B (thao tác nội bộ).<br>- Cơ chế On-Behalf-Of (OBO) ràng buộc trách nhiệm pháp lý của agent với danh tính người dùng/ủy quyền, kiểm soát delegation depth và thời hạn TTL. | - `agent/runner.py:53-115`<br>- `agent/policy.py:84-148`<br>- `reports/ledger.jsonl:1-24` | Lab sử dụng Fake/Mock LLM deterministic và danh tính mô phỏng từ `principals.json`, chưa phải hệ thống IAM/OAuth2 thực tế. |
+| **OWASP Agentic AI** (ASI01, ASI03, ASI04) | - **ASI01 (Prompt Injection):** Trifecta split vô hiệu hóa gián tiếp prompt injection; Run B chỉ lấy ticket ID từ tên file và tra cứu ở `customers.json`, không đọc customer ID từ free text của kẻ tấn công.<br>- **ASI03 (Unauthorized Tool Execution):** Policy PEP chặn đứng tool call vi phạm (chặn egress khi có dữ liệu restricted).<br>- **ASI04 (Improper Delegation & Supply Chain):** Gitleaks hook pin v8.30.1 kiểm soát bí mật; `requirements.lock` với SHA-256 hash lock toàn bộ phụ thuộc. | - `agent/runner.py:53-185`<br>- `agent/policy.py:84-148`<br>- `.pre-commit-config.yaml:1-7`<br>- `requirements.lock:1-120`<br>- `reports/secrets-incident.md:1-35` | PEP chạy nội bộ trong tiến trình Python; chưa tách thành service PEP/PDP độc lập như OPA/Cedar. |
 
-Chỉ ghi điều khoản cụ thể khi đã đối chiếu văn bản gốc. Mô phỏng kỹ thuật không tự chứng minh tuân thủ pháp luật.
+*Ghi chú: Mô phỏng kỹ thuật không tự chứng minh tuân thủ pháp luật đầy đủ; các điều khoản pháp lý cần được tư vấn và đối chiếu nguồn chính thức khi triển khai sản phẩm thực tế.*

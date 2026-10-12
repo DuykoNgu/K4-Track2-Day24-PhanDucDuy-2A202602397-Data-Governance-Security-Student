@@ -74,6 +74,10 @@ REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
+class RunnerScaffoldPending(NotImplementedError):
+    """Only the original 3c stub uses this to enable the CP1/CP2 baseline."""
+
+
 AGENT_ID = "lab24-agent"
 # TTL mặc định 1 giờ cho mỗi run
 DEFAULT_TTL_HOURS = 1

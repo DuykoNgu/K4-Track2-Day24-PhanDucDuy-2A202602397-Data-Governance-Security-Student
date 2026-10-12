@@ -59,16 +59,198 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+import uuid
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+from agent import ledger, tools
+from agent.policy import PolicyContext, check as policy_check
+from agent.pii import redact
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+
+AGENT_ID = "lab24-agent"
+# TTL mặc định 1 giờ cho mỗi run
+DEFAULT_TTL_HOURS = 1
+
+_TICKET_NUM_RE = re.compile(r"ticket-(\d+)(?:b)?\.md")
 
 
-class RunnerScaffoldPending(NotImplementedError):
-    """Only the original 3c stub uses this to enable the CP1/CP2 baseline."""
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def handle(message: str, llm, log_dir: Path | None = None,
-           principal_id: str = "support_l1") -> str:
-    raise RunnerScaffoldPending("BƯỚC 3c: implement trifecta split")
+def _expires_iso() -> str:
+    return (datetime.now(timezone.utc) + timedelta(hours=DEFAULT_TTL_HOURS)).isoformat()
+
+
+def _args_hash(*args) -> str:
+    raw = json.dumps(args, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _load_customers() -> list[dict]:
+    return json.loads((DATA_DIR / "customers.json").read_text(encoding="utf-8"))
+
+
+def _ticket_ids_to_customer_ids(ticket_ids: list[int]) -> list[str]:
+    """Map ticket_id -> customer_id qua related_tickets (nguồn tin cậy)."""
+    customers = _load_customers()
+    result = []
+    seen = set()
+    for customer in customers:
+        for tid in customer.get("related_tickets", []):
+            if tid in ticket_ids and customer["customer_id"] not in seen:
+                result.append(customer["customer_id"])
+                seen.add(customer["customer_id"])
+    return result
+
+
+def _do_policy_and_log(
+    tool_name: str,
+    args_for_hash,
+    classification: str,
+    purpose: str,
+    run_label: str,
+    run_id: str,
+    principal_id: str,
+    agent_scopes: tuple[str, ...],
+    parent_scopes: tuple[str, ...],
+    expires_at: str,
+    egress_enabled: bool,
+    ledger_path: Path,
+) -> tuple[bool, str]:
+    """Chạy policy check và ghi ledger. Trả về (allow, reason)."""
+    ctx = PolicyContext(
+        data_classification=classification,
+        request_purpose=purpose,
+        agent_owner=f"{AGENT_ID}/{run_label}",
+        delegation_depth=0,
+        egress_enabled=egress_enabled,
+        principal_id=principal_id,
+        requested_tool=tool_name,
+        agent_scopes=agent_scopes,
+        parent_scopes=parent_scopes,
+        expires_at=expires_at,
+    )
+    allow, reason = policy_check(ctx)
+    decision = "allow" if allow else "deny"
+
+    entry = {
+        "ts": _now_iso(),
+        "agent_id": AGENT_ID,
+        "run_id": run_id,
+        "tool": tool_name,
+        "args_hash": _args_hash(args_for_hash),
+        "classification": classification,
+        "decision": decision,
+        "reason": reason,
+        "on_behalf_of": principal_id,
+        "expires_at": expires_at,
+    }
+    ledger.append(entry, ledger_path)
+    return allow, reason
+
+
+def handle(
+    message: str,
+    llm,
+    log_dir: Path | None = None,
+    principal_id: str = "support_l1",
+) -> str:
+    """Trifecta split: Run A (untrusted) -> ticket_ids -> Run B (private)."""
+    ledger_path = (log_dir or REPORTS_DIR) / "ledger.jsonl"
+    expires_at = _expires_iso()
+
+    # Agent scopes: Run A chỉ có search_docs, Run B có read_customer
+    run_a_scopes = ("search_docs",)
+    run_b_scopes = ("search_docs", "read_customer", "http_post")
+
+    run_a_id = f"run-a-{uuid.uuid4().hex[:8]}"
+    run_b_id = f"run-b-{uuid.uuid4().hex[:8]}"
+
+    # ========== RUN A: search_docs (untrusted content) ==========
+    allow, reason = _do_policy_and_log(
+        tool_name="search_docs",
+        args_for_hash=message,
+        classification="internal",  # corpus là internal
+        purpose="summarize-tickets",
+        run_label="run-a",
+        run_id=run_a_id,
+        principal_id=principal_id,
+        agent_scopes=run_a_scopes,
+        parent_scopes=(),
+        expires_at=expires_at,
+        egress_enabled=False,  # Run A không có egress
+        ledger_path=ledger_path,
+    )
+
+    if not allow:
+        return f"Run A search_docs denied: {reason}"
+
+    docs = tools.search_docs(message)
+
+    # Trích ticket_id từ TÊN FILE (không phải nội dung)
+    ticket_ids: list[int] = []
+    for doc in docs:
+        m = _TICKET_NUM_RE.search(doc["id"])
+        if m:
+            ticket_ids.append(int(m.group(1)))
+
+    # Chạy find_injection để LOG (không dùng customer_id từ đây)
+    combined_text = "\n\n".join(d["text"] for d in docs)
+    injected = llm.find_injection(combined_text)
+    # Log injection detection nhưng KHÔNG dùng injected.customer_ids
+
+    # Nếu có injection -> log http_post deny (restricted + egress)
+    if injected is not None:
+        _do_policy_and_log(
+            tool_name="http_post",
+            args_for_hash=injected.target_url,
+            classification="restricted",
+            purpose="reconciliation",
+            run_label="run-b",
+            run_id=run_b_id,
+            principal_id=principal_id,
+            agent_scopes=run_b_scopes,
+            parent_scopes=(),
+            expires_at=expires_at,
+            egress_enabled=True,
+            ledger_path=ledger_path,
+        )
+
+    # ========== RUN B: read_customer (private data) ==========
+    # Map ticket_ids -> customer_ids qua related_tickets (nguồn tin cậy)
+    customer_ids = _ticket_ids_to_customer_ids(ticket_ids)
+
+    collected = []
+    for cid in customer_ids:
+        allow, reason = _do_policy_and_log(
+            tool_name="read_customer",
+            args_for_hash=cid,
+            classification="restricted",
+            purpose="support-reply",
+            run_label="run-b",
+            run_id=run_b_id,
+            principal_id=principal_id,
+            agent_scopes=run_b_scopes,
+            parent_scopes=(),
+            expires_at=expires_at,
+            egress_enabled=False,  # Run B read không có egress
+            ledger_path=ledger_path,
+        )
+        if allow:
+            try:
+                record = tools.read_customer(cid)
+                collected.append(record)
+            except tools.ToolError:
+                continue
+
+    # Summarize — redact PII trước khi trả về
+    summary = llm.summarize(docs)
+    return redact(summary)

@@ -30,10 +30,78 @@ set ở tests/vn_pii_testset.jsonl):
 """
 from __future__ import annotations
 
+import re
+
+
+# --- Regex patterns ---
+
+# EMAIL: match trước để tránh bị PHONE/CCCD cắn nhầm phần local
+_EMAIL_RE = re.compile(
+    r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"
+)
+
+# VN_CCCD: đúng 12 chữ số liên tiếp, không nằm trong chuỗi dài hơn
+_CCCD_RE = re.compile(r"(?<!\d)\d{12}(?!\d)")
+
+# VN_PHONE: bắt đầu bằng 0, theo sau là 9-10 chữ số (có thể xen dấu cách/gạch ngang)
+_PHONE_RE = re.compile(r"(?<!\d)0(?:[\d][\s\-]?){8,9}\d(?!\d)")
+
+# VN_BANK_ACCOUNT: 8-16 chữ số liên tiếp, đi kèm ngữ cảnh STK/tài khoản
+_BANK_CONTEXT_RE = re.compile(
+    r"(?:STK|stk|Stk|số tài khoản|so tai khoan|tài khoản|tai khoan|chuyển khoản tới)\s+(\d{8,16})(?!\d)",
+    re.IGNORECASE,
+)
+
 
 def detect(text: str) -> list[dict]:
-    raise NotImplementedError("BƯỚC 3a: implement PII detection")
+    """Phát hiện PII trong text, trả về list entity với type/start/end."""
+    entities: list[dict] = []
+    used_ranges: list[tuple[int, int]] = []
+
+    def _overlaps(start: int, end: int) -> bool:
+        return any(s < end and start < e for s, e in used_ranges)
+
+    # 1. EMAIL — ưu tiên cao nhất
+    for m in _EMAIL_RE.finditer(text):
+        s, e = m.start(), m.end()
+        if not _overlaps(s, e):
+            entities.append({"type": "EMAIL", "start": s, "end": e})
+            used_ranges.append((s, e))
+
+    # 2. BANK_ACCOUNT — cần ngữ cảnh, kiểm trước CCCD để tránh 12 chữ số bị bắt nhầm
+    for m in _BANK_CONTEXT_RE.finditer(text):
+        s, e = m.start(1), m.end(1)
+        if not _overlaps(s, e):
+            entities.append({"type": "VN_BANK_ACCOUNT", "start": s, "end": e})
+            used_ranges.append((s, e))
+
+    # 3. CCCD — đúng 12 chữ số
+    for m in _CCCD_RE.finditer(text):
+        s, e = m.start(), m.end()
+        if not _overlaps(s, e):
+            entities.append({"type": "VN_CCCD", "start": s, "end": e})
+            used_ranges.append((s, e))
+
+    # 4. PHONE — 0 + 9-10 chữ số
+    for m in _PHONE_RE.finditer(text):
+        raw = m.group()
+        digits = re.sub(r"[\s\-]", "", raw)
+        if len(digits) < 10 or len(digits) > 11:
+            continue
+        s, e = m.start(), m.end()
+        if not _overlaps(s, e):
+            entities.append({"type": "VN_PHONE", "start": s, "end": e})
+            used_ranges.append((s, e))
+
+    entities.sort(key=lambda x: x["start"])
+    return entities
 
 
 def redact(text: str) -> str:
-    raise NotImplementedError("BƯỚC 3a: implement PII redaction")
+    """Thay tất cả entity bằng [REDACTED_<TYPE>], xử lý từ cuối về đầu."""
+    entities = detect(text)
+    # Sắp xếp từ cuối về đầu để thay thế không lệch offset
+    for entity in sorted(entities, key=lambda x: x["start"], reverse=True):
+        replacement = f"[REDACTED_{entity['type']}]"
+        text = text[: entity["start"]] + replacement + text[entity["end"] :]
+    return text
